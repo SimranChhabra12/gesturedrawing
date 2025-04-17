@@ -48,21 +48,22 @@ async function setup() {
 }
 
 async function loadModel() {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
-  );
-
-  handLandmarker = await HandLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath:
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/hand_landmarker.task"
-    },
-    runningMode: "VIDEO",
-    numHands: 1
-  });
-
-  ready = true;
-}
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+    );
+  
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm/hand_landmarker.task"
+      },
+      runningMode: "VIDEO",
+      // Change to 2 if you want to detect both hands
+      numHands: 2 
+    });
+  
+    ready = true;
+  }  
 
 async function trackHand() {
   if (!ready || !video.loadedmetadata) return;
