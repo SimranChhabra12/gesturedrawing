@@ -1,19 +1,17 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <title>Gesture Drawing</title>
-    <!-- MediaPipe Tasks Vision -->
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0"></script>
-    <!-- p5.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.6.0/p5.min.js"></script>
     <script type="module" src="sketch.js"></script>
     <style>
       body {
         margin: 0;
-        font-family: sans-serif;
-        text-align: center;
         background: #f4f4f4;
+        text-align: center;
+        font-family: sans-serif;
       }
       canvas {
         display: block;
@@ -23,26 +21,18 @@
       #controls {
         margin: 10px;
       }
-      #controls button,
-      #controls input[type="range"] {
-        margin: 0 5px;
-        padding: 6px 12px;
+      button {
+        padding: 8px 16px;
         font-size: 14px;
-      }
-      #downloadLink {
-        margin-left: 10px;
       }
     </style>
   </head>
   <body>
     <div id="controls">
-      <button id="clearBtn">Clear Canvas</button>
-      <label>
-        Brush Size:
-        <input type="range" id="brushSize" min="1" max="20" value="4" />
-      </label>
-      <button id="recordBtn">Start Recording</button>
-      <a id="downloadLink" style="display:none;">Download Video</a>
+     // <button id="saveBtn">Save Drawing</button>
+      <button id="saveBtn">Save Drawing as SVG</button>
+     <button id="colorBtn">Change Brush Color</button>
+
     </div>
   </body>
 </html>
