@@ -1,136 +1,174 @@
-// Import MediaPipe Tasks for Vision as an ES module.
-import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+import { FilesetResolver, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
-let video;
-let handLandmarker;
-let drawing = [];
-let lastPoint = null;
-let ready = false;
-let brushSizeSlider;
+// Gesture thresholds in px
+const DRAW_THRESHOLD  = 60;  // thumb+index pinch
+const COLOR_THRESHOLD = 60;  // thumb+ring pinch
+const UNDO_THRESHOLD  = 60;  // thumb+pinky pinch
 
-// Recording
-let mediaRecorder;
-let recordedChunks = [];
-let recording = false;
+let video, handLandmarker;
+let ready = false, detecting = false;
+let paths = [], currentPath = [];
+let isDrawing = false;
+
+let currentColor = '#0066ff';
+const colorPalette = ['#0066ff','#ff3366','#ffaa00','#33cc33','#8000ff'];
+let currentColorIndex = 0;
+
+let currentBrushSize = 4;
+let cameraEnabled = true;
+let lastPos = null;
+
+// rising-edge flags
+let colorGestureActive = false;
+let undoGestureActive  = false;
 
 async function setup() {
-  // Create canvas and capture video
-  createCanvas(640, 480).parent(document.body);
-  video = createCapture(VIDEO);
-  video.size(640, 480);
+  const size = min(windowWidth, windowHeight) * 0.9;
+  createCanvas(min(windowWidth, windowHeight) * 0.99, min(windowWidth, windowHeight) * 0.99);
+  frameRate(30);
+
+  video = createCapture(VIDEO, () => console.log('Camera started'));
+  video.size(size, size);
   video.hide();
 
-  // Initialize UI elements before heavy async work.
-  document.getElementById('clearBtn').addEventListener('click', () => {
-    drawing = [];
-  });
-  brushSizeSlider = document.getElementById('brushSize');
-
-  const recordBtn = document.getElementById('recordBtn');
-  const downloadLink = document.getElementById('downloadLink');
-  recordBtn.addEventListener('click', () => {
-    if (!recording) {
-      startRecording();
-      recordBtn.textContent = 'Stop Recording';
-    } else {
-      stopRecording(() => {
-        recordBtn.textContent = 'Start Recording';
-        downloadLink.style.display = 'inline';
-      });
-    }
+  // brush-size slider
+  const brushSlider = document.getElementById('brushSize');
+  brushSlider.addEventListener('input', () => {
+    currentBrushSize = parseInt(brushSlider.value, 10);
   });
 
-  // Load the hand tracking model
+  select('#toggleCam').mousePressed(toggleCamera);
+  select('#undoBtn').mousePressed(() => { if (paths.length) paths.pop(); });
+  select('#clearBtn').mousePressed(() => { paths = []; currentPath = []; });
+  select('#saveBtn').mousePressed(saveAsSVG);
+  select('#colorIndicator').style('background', currentColor);
+
   await loadModel();
-
-  // Start the hand tracking loop after model is loaded.
-  setInterval(trackHand, 100);
 }
 
 async function loadModel() {
-    const vision = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
-    );
-  
-    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath:
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm/hand_landmarker.task"
-      },
-      runningMode: "VIDEO",
-      // Change to 2 if you want to detect both hands
-      numHands: 2 
-    });
-  
-    ready = true;
-  }  
-
-async function trackHand() {
-  if (!ready || !video.loadedmetadata) return;
-
-  const now = performance.now();
-  const result = await handLandmarker.detectForVideo(video.elt, now);
-
-  if (result.landmarks && result.landmarks.length > 0) {
-    const indexTip = result.landmarks[0][8];
-    const x = indexTip.x * width;
-    const y = indexTip.y * height;
-    const current = createVector(x, y);
-
-    if (lastPoint) {
-      drawing.push({ from: lastPoint.copy(), to: current.copy() });
-    }
-
-    lastPoint = current;
-  } else {
-    lastPoint = null;
-  }
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './hand_landmarker.task' },
+    runningMode: 'VIDEO', numHands: 1
+  });
+  ready = true;
 }
 
 function draw() {
-  background(255);
-  image(video, 0, 0, width, height);
+  clear();
+  if (cameraEnabled) {
+    push(); translate(width, 0); scale(-1, 1); image(video, 0, 0, width, height); pop();
+  } else if (lastPos) {
+    noStroke(); fill(currentColor);
+    circle(lastPos.x, lastPos.y, currentBrushSize * 2);
+  }
 
-  // Use the brush size value safely now that the slider is assigned.
-  stroke(0, 102, 255);
-  strokeWeight(parseInt(brushSizeSlider.value));
-  for (let segment of drawing) {
-    line(segment.from.x, segment.from.y, segment.to.x, segment.to.y);
+  if (ready && !detecting) trackHand();
+
+  // draw saved paths
+  noFill();
+  for (const path of paths) {
+    stroke(path[0].color);
+    strokeWeight(path[0].size);
+    beginShape(); path.forEach(pt => curveVertex(pt.point.x, pt.point.y)); endShape();
+  }
+
+  // draw current path
+  if (currentPath.length) {
+    stroke(currentPath[0].color);
+    strokeWeight(currentPath[0].size);
+    beginShape(); currentPath.forEach(pt => curveVertex(pt.point.x, pt.point.y)); endShape();
   }
 }
 
-// ---------- Recording Functions ----------
+async function trackHand() {
+  detecting = true;
+  try {
+    const now = performance.now();
+    const res = await handLandmarker.detectForVideo(video.elt, now);
+    if (res.landmarks?.length) {
+      const h    = res.landmarks[0];
+      const idx  = h[8], thumb = h[4], ring = h[16], pinky = h[20];
+      const toPx = (a,b) => dist((a.x-b.x)*width, (a.y-b.y)*height, 0, 0);
+      const dDraw  = toPx(idx, thumb);
+      const dColor = toPx(ring, thumb);
+      const dUndo  = toPx(pinky, thumb);
 
-function startRecording() {
-  recordedChunks = [];
-  const canvasStream = document.querySelector('canvas').captureStream(30);
-  mediaRecorder = new MediaRecorder(canvasStream, {
-    mimeType: "video/webm; codecs=vp9"
-  });
+      // mirror coords
+      const x = width - idx.x * width;
+      const y = idx.y * height;
+      lastPos = createVector(x, y);
 
-  mediaRecorder.ondataavailable = function (e) {
-    if (e.data.size > 0) recordedChunks.push(e.data);
-  };
+      // DRAW: thumb+index pinch
+      if (dDraw < DRAW_THRESHOLD) {
+        if (!isDrawing) {
+          isDrawing = true;
+          currentPath = [];
+        }
+        currentPath.push({ point: createVector(x, y), color: currentColor, size: currentBrushSize });
+      } else if (isDrawing) {
+        if (currentPath.length > 1) paths.push(currentPath.slice());
+        currentPath = [];
+        isDrawing = false;
+      }
 
-  mediaRecorder.onstop = function () {
-    const blob = new Blob(recordedChunks, { type: "video/webm" });
-    const url = URL.createObjectURL(blob);
-    const link = document.getElementById('downloadLink');
-    link.href = url;
-    link.download = "gesture_drawing.webm";
-    link.textContent = "Download Video";
-  };
+      // COLOR: thumb+ring rising-edge only when not drawing
+      if (!isDrawing && dColor < COLOR_THRESHOLD) {
+        if (!colorGestureActive) {
+          colorGestureActive = true;
+          currentColorIndex = (currentColorIndex + 1) % colorPalette.length;
+          currentColor = colorPalette[currentColorIndex];
+          select('#colorIndicator').style('background', currentColor);
+        }
+      } else {
+        colorGestureActive = false;
+      }
 
-  mediaRecorder.start();
-  recording = true;
+      // UNDO: thumb+pinky rising-edge only when not drawing
+      if (!isDrawing && dUndo < UNDO_THRESHOLD) {
+        if (!undoGestureActive && paths.length) {
+          undoGestureActive = true;
+          paths.pop();
+        }
+      } else {
+        undoGestureActive = false;
+      }
+
+    } else if (isDrawing) {
+      if (currentPath.length > 1) paths.push(currentPath.slice());
+      currentPath = [];
+      isDrawing = false;
+    }
+  } catch (e) {
+    console.error(e);
+  }
+  detecting = false;
 }
 
-function stopRecording(callback) {
-  mediaRecorder.stop();
-  recording = false;
-  if (callback) callback();
+function toggleCamera() {
+  cameraEnabled = !cameraEnabled;
+  select('#toggleCam').html(cameraEnabled ? 'Disable Camera' : 'Enable Camera');
 }
 
-// Expose p5.js functions globally since this script is now a module.
+function saveAsSVG() {
+  let svg = `<svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}'>`;
+  for (const path of paths) {
+    svg += `<polyline fill='none' stroke='${path[0].color}' stroke-width='${path[0].size}' points='`;
+    svg += path.map(p => `${p.point.x},${p.point.y}`).join(' ');
+    svg += `'/>
+`;
+  }
+  svg += `</svg>`;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+  link.download = 'gesture_drawing.svg';
+  link.click();
+}
+
+// expose to p5.js
 window.setup = setup;
-window.draw = draw;
+window.draw  = draw;
