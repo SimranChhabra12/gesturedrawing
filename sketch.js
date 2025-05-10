@@ -24,8 +24,13 @@ let colorGestureActive = false;
 let undoGestureActive  = false;
 
 async function setup() {
-  const size = min(windowWidth, windowHeight) * 0.9;
-  createCanvas(min(windowWidth, windowHeight) * 0.99, min(windowWidth, windowHeight) * 0.99);
+const size = min(windowWidth, windowHeight) * 0.9;
+let canvasElement = document.getElementById("drawingCanvas");
+let canvasWidth = canvasElement.offsetWidth;
+let canvasHeight = canvasElement.offsetHeight;
+createCanvas(canvasWidth, canvasHeight, canvasElement);
+
+  //createCanvas(min(windowWidth, windowHeight) * 0.99, min(windowWidth, windowHeight) * 0.99);
   frameRate(30);
 
   video = createCapture(VIDEO, () => console.log('Camera started'));
