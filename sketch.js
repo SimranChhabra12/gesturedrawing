@@ -1,9 +1,11 @@
 import { FilesetResolver, HandLandmarker }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
-// Draw uses hysteresis: tighter to start, looser to stop — prevents flickering
-const DRAW_START_THRESHOLD = 45;
-const DRAW_STOP_THRESHOLD  = 72;
+// Draw uses hysteresis: tighter to start, looser to stop — prevents flickering.
+// Measured as a fraction of palm length, in 3D, so it doesn't change when the hand
+// moves nearer/further or tilts (fixed pixels broke lines drawn across the face/body).
+const PINCH_START_RATIO = 0.25;
+const PINCH_KEEP_RATIO  = 0.45;
 const COLOR_THRESHOLD      = 60;
 const UNDO_THRESHOLD       = 60;
 
@@ -137,6 +139,22 @@ function isWaving() {
   return reversals >= 2;
 }
 
+// Pinch as a fraction of palm length, in 3D. Landmarks are normalised to the
+// frame (x to width, y to height, z roughly on x's scale), so scale back to the
+// video's aspect before measuring or distances stretch with the frame shape.
+function pinchRatio(h) {
+  const vw = video?.elt?.videoWidth || width, vh = video?.elt?.videoHeight || height;
+  const d3 = (a, b) => Math.hypot((a.x - b.x) * vw, (a.y - b.y) * vh, ((a.z ?? 0) - (b.z ?? 0)) * vw);
+  // Palm length from the wrist to the index and pinky knuckles; whichever is
+  // longer survives the hand turning side-on
+  const palm = Math.max(d3(h[0], h[5]), d3(h[0], h[17]));
+  if (palm < 1) return Infinity;
+  // Closest thumb-to-index contact of three pairs, so a single misplaced
+  // fingertip doesn't read as the pinch opening
+  const gap = Math.min(d3(h[4], h[8]), d3(h[4], h[7]), d3(h[3], h[8]));
+  return gap / palm;
+}
+
 // Fist: all four fingertips below their PIP joints (y increases downward)
 const FIST_MARGIN = 0.02;
 function isFist(h) {
@@ -209,7 +227,7 @@ function maybeRelease(now, badge, reason) {
 // Shows what the tracker sees and why each line ended, so breaks can be traced
 // to a cause instead of guessed at.
 const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
-const dbg = { hand: false, score: null, landmarks: null, rawPinch: null, pinch: null,
+const dbg = { hand: false, score: null, landmarks: null, rawPinch: null, pinch: null, peakPinch: null,
               seen: [], breaks: {}, lastBreak: null, el: null };
 
 function recordDebug(res) {
@@ -229,7 +247,7 @@ function drawDebug() {
     noStroke(); fill(255, 255, 255, 200);
     for (const l of h) { const [x, y] = P(l); circle(x, y, 7); }
     const [ix, iy] = P(h[8]), [tx, ty] = P(h[4]);
-    const threshold = isDrawing ? DRAW_STOP_THRESHOLD : DRAW_START_THRESHOLD;
+    const threshold = isDrawing ? PINCH_KEEP_RATIO : PINCH_START_RATIO;
     stroke(dbg.pinch !== null && dbg.pinch < threshold ? color(40, 200, 120) : color(230, 60, 60));
     strokeWeight(3); line(ix, iy, tx, ty);
     noStroke(); fill(255, 220, 0); circle(ix, iy, 12); circle(tx, ty, 12);
@@ -260,8 +278,10 @@ function drawDebug() {
   dbg.el.textContent =
     `hand found:   ${dbg.hand ? 'yes' : 'NO'}${dbg.score !== null ? ` (confidence ${dbg.score.toFixed(2)})` : ''}\n` +
     `tracked:      ${seenPct}% of last 2s\n` +
-    `pinch:        ${dbg.pinch !== null ? Math.round(dbg.pinch) + 'px' : '-'}` +
-    `${dbg.rawPinch !== null ? ` (raw ${Math.round(dbg.rawPinch)}px)` : ''}  start <${DRAW_START_THRESHOLD}, keep <${DRAW_STOP_THRESHOLD}\n` +
+    `pinch:        ${dbg.pinch !== null ? dbg.pinch.toFixed(2) : '-'}` +
+    `${dbg.rawPinch !== null ? ` (raw ${dbg.rawPinch.toFixed(2)})` : ''}  start <${PINCH_START_RATIO}, keep <${PINCH_KEEP_RATIO}` +
+    `  [x palm length]\n` +
+    `peak pinch while drawing: ${dbg.peakPinch !== null ? dbg.peakPinch.toFixed(2) : '-'}\n` +
     `fist frames:  ${fistFrames} (counts at ${FIST_CONFIRM_FRAMES})\n` +
     `state:        ${state}\n` +
     `normalise:    ${NORMALISE ? 'on' : 'off'}\n` +
@@ -384,7 +404,7 @@ async function trackHand() {
       const h    = res.landmarks[0];
       const idx  = h[8], thumb = h[4], ring = h[16], pinky = h[20];
       const toPx = (a, b) => dist((a.x - b.x) * width, (a.y - b.y) * height, 0, 0);
-      const rawPinch = toPx(idx, thumb);
+      const rawPinch = pinchRatio(h);
       const dColor = toPx(ring, thumb);
       const dUndo  = toPx(pinky, thumb);
 
@@ -404,7 +424,12 @@ async function trackHand() {
 
       const fist = isFist(h);
       fistFrames = fist ? fistFrames + 1 : 0;
-      if (DEBUG) { dbg.rawPinch = rawPinch; dbg.pinch = dDraw; }
+      if (DEBUG) {
+        dbg.rawPinch = rawPinch; dbg.pinch = dDraw;
+        // Highest pinch reading during the current line — shows how close a break came
+        if (isDrawing) dbg.peakPinch = Math.max(dbg.peakPinch ?? 0, dDraw);
+        else dbg.peakPinch = null;
+      }
 
       // FIST takes priority — checked first so it isn't blocked by draw detection
       // (making a fist also brings thumb+index together, which would trigger draw)
@@ -425,7 +450,7 @@ async function trackHand() {
         fistGestureActive = false;
 
         // DRAW: hysteresis — tight threshold to start, relaxed to stop
-        const stopThreshold = isDrawing ? DRAW_STOP_THRESHOLD : DRAW_START_THRESHOLD;
+        const stopThreshold = isDrawing ? PINCH_KEEP_RATIO : PINCH_START_RATIO;
         if (dDraw < stopThreshold) {
           const last = currentPath[currentPath.length - 1];
           // Coming back from a dropout far from where the line stopped: that's a new line
