@@ -185,7 +185,11 @@ let smoothPos   = null;
 let smoothPinch = null;
 let fistFrames  = 0;
 
-function endStroke(badge) {
+function endStroke(badge, reason) {
+  if (DEBUG && reason && currentPath.length > 1) {
+    dbg.breaks[reason] = (dbg.breaks[reason] || 0) + 1;
+    dbg.lastBreak = { reason, t: performance.now() };
+  }
   if (currentPath.length > 1) paths.push(currentPath.slice());
   currentPath = [];
   isDrawing = false;
@@ -195,10 +199,74 @@ function endStroke(badge) {
 
 // Called on any frame where the stroke would have ended; only ends it once the
 // loss has lasted longer than the grace period.
-function maybeRelease(now, badge) {
+function maybeRelease(now, badge, reason) {
   if (!isDrawing) return;
   if (releaseAt === null) releaseAt = now;
-  else if (now - releaseAt > STROKE_GRACE_MS) endStroke(badge);
+  else if (now - releaseAt > STROKE_GRACE_MS) endStroke(badge, reason);
+}
+
+// ── Debug overlay (?debug=1) ──
+// Shows what the tracker sees and why each line ended, so breaks can be traced
+// to a cause instead of guessed at.
+const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
+const dbg = { hand: false, score: null, landmarks: null, rawPinch: null, pinch: null,
+              seen: [], breaks: {}, lastBreak: null, el: null };
+
+function recordDebug(res) {
+  dbg.hand = !!res.landmarks?.length;
+  dbg.landmarks = dbg.hand ? res.landmarks[0] : null;
+  const hd = res.handednesses || res.handedness;
+  dbg.score = hd?.[0]?.[0]?.score ?? null;
+  if (!dbg.hand) { dbg.rawPinch = null; dbg.pinch = null; }
+  dbg.seen.push(dbg.hand);
+  if (dbg.seen.length > 60) dbg.seen.shift();  // ~2s at 30fps
+}
+
+function drawDebug() {
+  const h = dbg.landmarks;
+  if (h) {
+    const P = (l) => [width - l.x * width, l.y * height];
+    noStroke(); fill(255, 255, 255, 200);
+    for (const l of h) { const [x, y] = P(l); circle(x, y, 7); }
+    const [ix, iy] = P(h[8]), [tx, ty] = P(h[4]);
+    const threshold = isDrawing ? DRAW_STOP_THRESHOLD : DRAW_START_THRESHOLD;
+    stroke(dbg.pinch !== null && dbg.pinch < threshold ? color(40, 200, 120) : color(230, 60, 60));
+    strokeWeight(3); line(ix, iy, tx, ty);
+    noStroke(); fill(255, 220, 0); circle(ix, iy, 12); circle(tx, ty, 12);
+  }
+  // What the model is actually given (after normalisation), mirrored to match the view
+  if (NORMALISE && normCanvas) {
+    const tw = 180, th = tw * normCanvas.height / normCanvas.width;
+    const ctx = drawingContext;
+    ctx.save(); ctx.translate(12 + tw, height - th - 12); ctx.scale(-1, 1);
+    ctx.drawImage(normCanvas, 0, 0, tw, th); ctx.restore();
+    noFill(); stroke(255); strokeWeight(1); rect(12, height - th - 12, tw, th);
+  }
+
+  if (!dbg.el) {
+    dbg.el = document.createElement('pre');
+    dbg.el.style.cssText = 'position:fixed;top:64px;right:16px;z-index:200;margin:0;padding:10px 12px;' +
+      'background:rgba(20,20,20,.82);color:#fff;font:12px/1.5 ui-monospace,Menlo,monospace;' +
+      'border-radius:8px;pointer-events:none;white-space:pre';
+    document.body.appendChild(dbg.el);
+  }
+  const seenPct = dbg.seen.length ? Math.round(100 * dbg.seen.filter(Boolean).length / dbg.seen.length) : 0;
+  const state = !isDrawing ? 'not drawing'
+    : releaseAt !== null ? `holding line (${Math.round(performance.now() - releaseAt)}ms of ${STROKE_GRACE_MS})`
+    : 'drawing';
+  const breaks = Object.entries(dbg.breaks).map(([r, n]) => `  ${r}: ${n}`).join('\n') || '  none yet';
+  const last = dbg.lastBreak
+    ? `${dbg.lastBreak.reason}, ${((performance.now() - dbg.lastBreak.t) / 1000).toFixed(1)}s ago` : '-';
+  dbg.el.textContent =
+    `hand found:   ${dbg.hand ? 'yes' : 'NO'}${dbg.score !== null ? ` (confidence ${dbg.score.toFixed(2)})` : ''}\n` +
+    `tracked:      ${seenPct}% of last 2s\n` +
+    `pinch:        ${dbg.pinch !== null ? Math.round(dbg.pinch) + 'px' : '-'}` +
+    `${dbg.rawPinch !== null ? ` (raw ${Math.round(dbg.rawPinch)}px)` : ''}  start <${DRAW_START_THRESHOLD}, keep <${DRAW_STOP_THRESHOLD}\n` +
+    `fist frames:  ${fistFrames} (counts at ${FIST_CONFIRM_FRAMES})\n` +
+    `state:        ${state}\n` +
+    `normalise:    ${NORMALISE ? 'on' : 'off'}\n` +
+    `lines ended by:\n${breaks}\n` +
+    `last break:   ${last}`;
 }
 
 // rising-edge flags
@@ -295,6 +363,8 @@ function draw() {
     f.life -= f.decay;
     drawFlower(f);
   }
+
+  if (DEBUG) drawDebug();
 }
 
 async function trackHand() {
@@ -303,6 +373,7 @@ async function trackHand() {
     const now = performance.now();
     const frame = NORMALISE ? normalisedFrame(video.elt) : video.elt;
     const res = await handLandmarker.detectForVideo(frame, now);
+    if (DEBUG) recordDebug(res);
 
     if (res.landmarks?.length) {
       if (!handVisible) {
@@ -333,12 +404,13 @@ async function trackHand() {
 
       const fist = isFist(h);
       fistFrames = fist ? fistFrames + 1 : 0;
+      if (DEBUG) { dbg.rawPinch = rawPinch; dbg.pinch = dDraw; }
 
       // FIST takes priority — checked first so it isn't blocked by draw detection
       // (making a fist also brings thumb+index together, which would trigger draw)
       if (fistFrames >= FIST_CONFIRM_FRAMES) {
         // cancel any in-progress stroke
-        if (isDrawing) endStroke();
+        if (isDrawing) endStroke(null, 'fist detected');
         if (!fistGestureActive) {
           fistGestureActive = true;
           const hx = width - h[9].x * width;
@@ -359,7 +431,7 @@ async function trackHand() {
           // Coming back from a dropout far from where the line stopped: that's a new line
           if (isDrawing && releaseAt !== null && last &&
               dist(x, y, last.point.x, last.point.y) > MAX_BRIDGE_DIST) {
-            endStroke();
+            endStroke(null, 'hand came back far away');
           }
           releaseAt = null;
           if (!isDrawing) {
@@ -372,7 +444,7 @@ async function trackHand() {
             currentPath.push({ point: createVector(x, y), color: currentColor, size: currentBrushSize });
           }
         } else {
-          maybeRelease(now, 'hand');
+          maybeRelease(now, 'hand', 'pinch read as open');
         }
 
         // COLOR: thumb+ring rising-edge, not while drawing
@@ -418,7 +490,7 @@ async function trackHand() {
         if (window.setGestureBadge) window.setGestureBadge('idle');
       }
       fistFrames = 0;
-      maybeRelease(now);
+      maybeRelease(now, null, 'hand lost by tracker');
       // Once the stroke is really over, drop the smoothing history so the next
       // line doesn't glide in from where the last one ended.
       if (!isDrawing) { smoothPos = null; smoothPinch = null; }
