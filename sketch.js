@@ -10,6 +10,72 @@ const UNDO_THRESHOLD       = 60;
 // Minimum pixel distance between recorded points — avoids Catmull-Rom overshoot
 const MIN_POINT_DIST = 4;
 
+// Tracking drops out for a frame or two whenever the lighting shifts. Don't end a
+// stroke on the first bad frame: hold it open this long, and if the pinch comes
+// back in time, keep drawing into the same line.
+const STROKE_GRACE_MS = 300;
+// ...unless the hand reappears this far from where the line stopped — then it's a new line.
+const MAX_BRIDGE_DIST = 150;
+// A fist has to hold this many frames before it counts, so one misread frame
+// can't cut a line off.
+const FIST_CONFIRM_FRAMES = 3;
+// Exponential smoothing on the fingertip position and pinch distance (0–1, lower = smoother)
+const SMOOTH_POS   = 0.5;
+const SMOOTH_PINCH = 0.4;
+
+// ── Lighting normalisation ──
+// The model sees a contrast-stretched copy of each frame, so a lamp switching on
+// or a cloud passing doesn't change what the hand looks like to it. The display
+// still shows the raw camera. Add ?norm=0 to the URL to turn it off and compare.
+const NORMALISE      = new URLSearchParams(location.search).get('norm') !== '0';
+const NORM_WIDTH     = 320;   // the model downsamples anyway; this keeps pixel work cheap
+const NORM_LOW_PCT   = 0.02;  // black point: darkest 2% of pixels
+const NORM_HIGH_PCT  = 0.98;  // white point: brightest 2%
+const NORM_ADAPT     = 0.15;  // how fast the levels follow the light (0–1), slow enough not to pump
+const NORM_MIN_RANGE = 64;    // caps the gain at 4x so a dark room turns grainy, not noise
+let normCanvas = null, normCtx = null;
+let normLo = 0, normHi = 255;
+
+function normalisedFrame(videoEl) {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw || !vh) return videoEl;
+  const w = NORM_WIDTH, h = Math.round(NORM_WIDTH * vh / vw);
+  if (!normCanvas || normCanvas.height !== h) {
+    normCanvas = document.createElement('canvas');
+    normCanvas.width = w; normCanvas.height = h;
+    normCtx = normCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  normCtx.drawImage(videoEl, 0, 0, w, h);
+  const img = normCtx.getImageData(0, 0, w, h);
+  const px = img.data, n = w * h;
+
+  // Luminance histogram → this frame's black and white points
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < px.length; i += 4) {
+    hist[(px[i] * 77 + px[i + 1] * 150 + px[i + 2] * 29) >> 8]++;
+  }
+  let lo = 0, hi = 255, acc = 0;
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * NORM_LOW_PCT) { lo = v; break; } }
+  acc = 0;
+  for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= n * (1 - NORM_HIGH_PCT)) { hi = v; break; } }
+
+  // Ease towards them rather than jumping, so the image doesn't flicker frame to frame
+  normLo += (lo - normLo) * NORM_ADAPT;
+  normHi += (hi - normHi) * NORM_ADAPT;
+  let range = normHi - normLo;
+  let base = normLo;
+  if (range < NORM_MIN_RANGE) { base -= (NORM_MIN_RANGE - range) / 2; range = NORM_MIN_RANGE; }
+
+  // Stretch every channel by the same amount so skin tone keeps its colour
+  const lut = new Uint8ClampedArray(256);
+  for (let v = 0; v < 256; v++) lut[v] = ((v - base) * 255) / range;
+  for (let i = 0; i < px.length; i += 4) {
+    px[i] = lut[px[i]]; px[i + 1] = lut[px[i + 1]]; px[i + 2] = lut[px[i + 2]];
+  }
+  normCtx.putImageData(img, 0, 0);
+  return normCanvas;
+}
+
 // Flower particle system
 let flowers = [];
 
@@ -113,6 +179,28 @@ let cameraEnabled = true;
 let lastPos = null;
 let handVisible = false;
 
+// stroke-smoothing state
+let releaseAt   = null;  // when the pinch/hand was first lost mid-stroke
+let smoothPos   = null;
+let smoothPinch = null;
+let fistFrames  = 0;
+
+function endStroke(badge) {
+  if (currentPath.length > 1) paths.push(currentPath.slice());
+  currentPath = [];
+  isDrawing = false;
+  releaseAt = null;
+  if (badge && window.setGestureBadge) window.setGestureBadge(badge);
+}
+
+// Called on any frame where the stroke would have ended; only ends it once the
+// loss has lasted longer than the grace period.
+function maybeRelease(now, badge) {
+  if (!isDrawing) return;
+  if (releaseAt === null) releaseAt = now;
+  else if (now - releaseAt > STROKE_GRACE_MS) endStroke(badge);
+}
+
 // rising-edge flags
 let colorGestureActive = false;
 let undoGestureActive  = false;
@@ -145,7 +233,9 @@ async function setup() {
 
   select('#toggleCam').mousePressed(toggleCamera);
   select('#undoBtn').mousePressed(() => { if (paths.length) paths.pop(); });
-  select('#clearBtn').mousePressed(() => { paths = []; currentPath = []; flowers = []; });
+  select('#clearBtn').mousePressed(() => {
+    paths = []; currentPath = []; flowers = []; isDrawing = false; releaseAt = null;
+  });
   select('#saveBtn').mousePressed(saveAsSVG);
 
   await loadModel();
@@ -157,7 +247,11 @@ async function loadModel() {
   );
   handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: { modelAssetPath: './hand_landmarker.task' },
-    runningMode: 'VIDEO', numHands: 1
+    runningMode: 'VIDEO', numHands: 1,
+    // Defaults are 0.5; lower keeps hold of the hand through dim or uneven light
+    minHandDetectionConfidence: 0.3,
+    minHandPresenceConfidence:  0.3,
+    minTrackingConfidence:      0.3
   });
   ready = true;
 
@@ -207,7 +301,8 @@ async function trackHand() {
   detecting = true;
   try {
     const now = performance.now();
-    const res = await handLandmarker.detectForVideo(video.elt, now);
+    const frame = NORMALISE ? normalisedFrame(video.elt) : video.elt;
+    const res = await handLandmarker.detectForVideo(frame, now);
 
     if (res.landmarks?.length) {
       if (!handVisible) {
@@ -218,24 +313,32 @@ async function trackHand() {
       const h    = res.landmarks[0];
       const idx  = h[8], thumb = h[4], ring = h[16], pinky = h[20];
       const toPx = (a, b) => dist((a.x - b.x) * width, (a.y - b.y) * height, 0, 0);
-      const dDraw  = toPx(idx, thumb);
+      const rawPinch = toPx(idx, thumb);
       const dColor = toPx(ring, thumb);
       const dUndo  = toPx(pinky, thumb);
 
-      // mirror coords
-      const x = width - idx.x * width;
-      const y = idx.y * height;
+      // mirror coords, then smooth so one jittery frame doesn't jolt the line
+      const rawX = width - idx.x * width;
+      const rawY = idx.y * height;
+      if (smoothPos) {
+        smoothPos.x = lerp(smoothPos.x, rawX, SMOOTH_POS);
+        smoothPos.y = lerp(smoothPos.y, rawY, SMOOTH_POS);
+      } else {
+        smoothPos = createVector(rawX, rawY);
+      }
+      smoothPinch = smoothPinch === null ? rawPinch : lerp(smoothPinch, rawPinch, SMOOTH_PINCH);
+      const x = smoothPos.x, y = smoothPos.y;
+      const dDraw = smoothPinch;
       lastPos = createVector(x, y);
+
+      const fist = isFist(h);
+      fistFrames = fist ? fistFrames + 1 : 0;
 
       // FIST takes priority — checked first so it isn't blocked by draw detection
       // (making a fist also brings thumb+index together, which would trigger draw)
-      if (isFist(h)) {
+      if (fistFrames >= FIST_CONFIRM_FRAMES) {
         // cancel any in-progress stroke
-        if (isDrawing) {
-          if (currentPath.length > 1) paths.push(currentPath.slice());
-          currentPath = [];
-          isDrawing = false;
-        }
+        if (isDrawing) endStroke();
         if (!fistGestureActive) {
           fistGestureActive = true;
           const hx = width - h[9].x * width;
@@ -243,26 +346,33 @@ async function trackHand() {
           spawnFlowerBurst(hx, hy);
           if (window.setGestureBadge) window.setGestureBadge('fist');
         }
+      } else if (fist) {
+        // Looks like a fist but not confirmed yet — hold the stroke as it is
+        // rather than drawing or ending it on a possibly misread frame.
       } else {
         fistGestureActive = false;
 
         // DRAW: hysteresis — tight threshold to start, relaxed to stop
         const stopThreshold = isDrawing ? DRAW_STOP_THRESHOLD : DRAW_START_THRESHOLD;
         if (dDraw < stopThreshold) {
+          const last = currentPath[currentPath.length - 1];
+          // Coming back from a dropout far from where the line stopped: that's a new line
+          if (isDrawing && releaseAt !== null && last &&
+              dist(x, y, last.point.x, last.point.y) > MAX_BRIDGE_DIST) {
+            endStroke();
+          }
+          releaseAt = null;
           if (!isDrawing) {
             isDrawing = true;
             currentPath = [];
             if (window.setGestureBadge) window.setGestureBadge('drawing');
           }
-          const last = currentPath[currentPath.length - 1];
-          if (!last || dist(x, y, last.point.x, last.point.y) >= MIN_POINT_DIST) {
+          const prev = currentPath[currentPath.length - 1];
+          if (!prev || dist(x, y, prev.point.x, prev.point.y) >= MIN_POINT_DIST) {
             currentPath.push({ point: createVector(x, y), color: currentColor, size: currentBrushSize });
           }
-        } else if (isDrawing) {
-          if (currentPath.length > 1) paths.push(currentPath.slice());
-          currentPath = [];
-          isDrawing = false;
-          if (window.setGestureBadge) window.setGestureBadge('hand');
+        } else {
+          maybeRelease(now, 'hand');
         }
 
         // COLOR: thumb+ring rising-edge, not while drawing
@@ -307,11 +417,11 @@ async function trackHand() {
         handVisible = false;
         if (window.setGestureBadge) window.setGestureBadge('idle');
       }
-      if (isDrawing) {
-        if (currentPath.length > 1) paths.push(currentPath.slice());
-        currentPath = [];
-        isDrawing = false;
-      }
+      fistFrames = 0;
+      maybeRelease(now);
+      // Once the stroke is really over, drop the smoothing history so the next
+      // line doesn't glide in from where the last one ended.
+      if (!isDrawing) { smoothPos = null; smoothPinch = null; }
     }
   } catch (e) {
     console.error(e);
